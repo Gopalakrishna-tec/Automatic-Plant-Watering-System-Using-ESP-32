@@ -37,8 +37,8 @@ HardwareSerial sim900(2); // UART2: GPIO16=RX2, GPIO17=TX2
 //   SYSTEM FLAGS
 // =====================
 bool displayAvailable  = false;
-int  oledFailCount     = 0;     // consecutive OLED write failures
-unsigned long lastOledReinit = 0; // millis of last reinit attempt
+int  oledFailCount     = 0;
+unsigned long lastOledReinit = 0;
 bool rtcAvailable     = false;
 bool simAvailable     = false;
 
@@ -55,7 +55,7 @@ int      smsQueueCount = 0;
 enum SmsState { SMS_IDLE, SMS_SET_MODE, SMS_SEND_CMD, SMS_WAIT_PROMPT, SMS_SEND_BODY, SMS_WAIT_CONFIRM };
 SmsState smsState       = SMS_IDLE;
 unsigned long smsStateStart    = 0;
-unsigned long smsCooldownUntil = 0; // dont start next send until this millis
+unsigned long smsCooldownUntil = 0;
 String   smsPending     = "";
 
 // =====================
@@ -66,18 +66,18 @@ String   smsPending     = "";
 #define MOISTURE_WET          1500
 #define MOISTURE_LOW          25
 #define MOISTURE_HIGH         50
-#define MOISTURE_HYSTERESIS   5    // deadband around thresholds to prevent chatter
-#define PUMP_COOLDOWN         30000 // 30s minimum between pump cycles
+#define MOISTURE_HYSTERESIS   5
+#define PUMP_COOLDOWN         30000
 #define RAIN_PER_MINUTE       0.5
 #define PUMP_ON_DURATION      20000
 #define SENSOR_READ_DELAY     2000
 #define SIGNAL_CHECK_INTERVAL 10000
 #define PAGE_INTERVAL         4000
 #define DHT_READ_ATTEMPTS     3
-#define SMS_THROTTLE_TIME     15000  // 15s between auto/alert SMSes; commands bypass this
+#define SMS_THROTTLE_TIME     15000
 
 // =====================
-//   STRUCTS (before forward declarations)
+//   STRUCTS
 // =====================
 struct SensorData {
   float temperature;
@@ -134,16 +134,18 @@ bool wateringCycleActive  = false;
 unsigned long pumpStartMillis = 0;
 int wateringCountToday    = 0;
 int lastWateringSimDay    = -1;
-bool rainedToday          = false; // if true, no watering for rest of sim day
+unsigned long rainStopTime = 0;    // millis when rain stopped
+bool rainActive            = false; // currently raining
+#define RAIN_RESUME_DELAY  25000   // 25s after rain stops before pump can resume
 int wateringHours[4]      = {0, 6, 12, 18};
 
 // =====================
 //   PUMP CONTROL
 // =====================
 bool pumpRunning    = false;
-bool manualOverride = false;
+bool manualOverride = false;       // stays true until AUTO command received
 unsigned long pumpOnTime      = 0;
-unsigned long pumpLastOffTime = 0; // for cooldown between cycles
+unsigned long pumpLastOffTime = 0;
 
 // =====================
 //   DISPLAY
@@ -170,6 +172,13 @@ unsigned long lastSensorRead  = 0;
 //   SENSOR SNAPSHOT
 // =====================
 SensorData lastKnownData;
+int dryReadCount = 0; // consecutive dry reads before pump triggers
+
+// =====================
+//   SERIAL PORT OWNERSHIP
+// =====================
+String simBuffer = "";
+bool   simBusy   = false;
 
 // =====================
 //   HELPER: Moisture %
@@ -194,14 +203,14 @@ void setPump(bool state) {
   if (state) {
     pumpOnTime = millis();
   } else {
-    pumpLastOffTime = millis(); // record when pump turned off for cooldown
+    pumpLastOffTime = millis();
   }
-  Serial.println(state ? "[PUMP] ON" : "[PUMP] OFF");
+  Serial.printf("[PUMP] %s moisture=%.1f pumpOnTime=%lu now=%lu duration=%lu\n",
+    state ? "ON" : "OFF", lastKnownData.moisture, pumpOnTime, millis(), millis() - pumpOnTime);
 }
 
 // =====================
 //   HELPER: SMS Throttle
-//   force=true bypasses throttle for command replies & critical alerts
 // =====================
 bool canSendSMS(bool force) {
   if (force || millis() - lastSMSTime >= SMS_THROTTLE_TIME) {
@@ -256,7 +265,6 @@ SensorData readSensors() {
 //   HELPER: Sim Time
 // =====================
 SimTime getSimTime() {
-  // Time scale: 1 real second = 8 sim minutes → 1 sim day = 3 real minutes
   unsigned long elapsed    = (millis() - simStartMillis) / 1000;
   unsigned long simMinutes = elapsed * 8;
   SimTime st;
@@ -269,32 +277,27 @@ SimTime getSimTime() {
 }
 
 // =====================
-//   OLED: Draw Signal Bars (top-right corner)
-//   x,y = top-left of bar cluster
-//   bars = 0..4
+//   OLED: Draw Signal Bars
 // =====================
 void drawSignalBars(int x, int y, int bars) {
-  // 4 bars, each taller than last: w=3px, gap=1px
-  // heights: 4, 6, 8, 10 px; baseline at y+10
-  int barW    = 3;
-  int gap     = 1;
+  int barW       = 3;
+  int gap        = 1;
   int heights[4] = {4, 6, 8, 10};
-  int baseline = y + 10;
+  int baseline   = y + 10;
   for (int i = 0; i < 4; i++) {
     int bx = x + i * (barW + gap);
     int bh = heights[i];
     int by = baseline - bh;
     if (i < bars) {
-      display.fillRect(bx, by, barW, bh, SSD1306_WHITE); // filled = active
+      display.fillRect(bx, by, barW, bh, SSD1306_WHITE);
     } else {
-      display.drawRect(bx, by, barW, bh, SSD1306_WHITE); // outline = inactive
+      display.drawRect(bx, by, barW, bh, SSD1306_WHITE);
     }
   }
 }
 
 // =====================
 //   OLED: Draw Moisture Bar
-//   full-width progress bar
 // =====================
 void drawMoistureBar(int y, float pct) {
   int barX = 0, barW = 128, barH = 6;
@@ -304,37 +307,30 @@ void drawMoistureBar(int y, float pct) {
 }
 
 // =====================
-//   OLED: Status Bar (top row, every page)
-//   Shows: pump indicator | page dots | signal bars
+//   OLED: Status Bar
 // =====================
 void drawStatusBar(int page) {
-  // Pump dot
   if (pumpRunning) {
     display.fillCircle(3, 3, 3, SSD1306_WHITE);
   } else {
     display.drawCircle(3, 3, 3, SSD1306_WHITE);
   }
-  // "P" label
   display.setTextSize(1);
   display.setCursor(9, 0);
-  display.print(manualOverride ? "M" : "A"); // M=manual A=auto
+  display.print(manualOverride ? "M" : "A");
 
-  // Page dots (center)
   int dotX = 56;
   for (int i = 0; i < 4; i++) {
     if (i == page) display.fillCircle(dotX + i * 6, 3, 2, SSD1306_WHITE);
     else           display.drawCircle(dotX + i * 6, 3, 2, SSD1306_WHITE);
   }
 
-  // Signal bars (top-right)
   drawSignalBars(112, 0, signalBars);
-
-  // Divider line
   display.drawFastHLine(0, 8, 128, SSD1306_WHITE);
 }
 
 // =====================
-//   OLED: Update Display (4 rotating pages)
+//   OLED: Update Display
 // =====================
 void updateOLED(SensorData data) {
   if (!displayAvailable) return;
@@ -352,12 +348,10 @@ void updateOLED(SensorData data) {
 
   switch (oledPage) {
 
-    // ---- PAGE 0: Temperature & Humidity ----
     case 0:
       display.setTextSize(1);
       display.setCursor(0, 11);
       display.println("ENVIRONMENT");
-
       display.setTextSize(2);
       display.setCursor(0, 22);
       if (data.isValid) {
@@ -369,7 +363,6 @@ void updateOLED(SensorData data) {
         display.setTextSize(1);
         display.print(" ERR");
       }
-
       display.setTextSize(2);
       display.setCursor(0, 44);
       if (data.isValid) {
@@ -381,43 +374,31 @@ void updateOLED(SensorData data) {
       }
       break;
 
-    // ---- PAGE 1: Soil Moisture & Rain ----
     case 1:
       display.setTextSize(1);
       display.setCursor(0, 11);
       display.println("SOIL & RAIN");
-
-      // Moisture big number
       display.setTextSize(2);
       display.setCursor(0, 22);
       display.printf("%d%%", (int)data.moisture);
-
-      // Status tag — 3-tier moisture zones
       display.setTextSize(1);
       display.setCursor(52, 24);
-      if      (data.moisture < MOISTURE_LOW)   display.print("[DRY!]");  // 0-25%: pump now
-      else if (data.moisture <= MOISTURE_HIGH) display.print("[SCHED]"); // 25-50%: interval
-      else                                     display.print("[WET] ");  // >50%: no water
-
-      // Moisture bar
+      if      (data.moisture < MOISTURE_LOW)   display.print("[DRY!]");
+      else if (data.moisture <= MOISTURE_HIGH) display.print("[SCHED]");
+      else                                     display.print("[WET] ");
       drawMoistureBar(38, data.moisture);
-
-      // Rain status - ALL IN ONE LINE
       display.setCursor(0, 49);
-      display.printf("R:%s D:%.1f W:%.1f M:%.1fmm", 
+      display.printf("R:%s D:%.1f W:%.1f M:%.1fmm",
         data.isRaining ? "YES" : "No ", rainDaily, rainWeekly, rainMonthly);
       break;
 
-    // ---- PAGE 2: Pump & Watering ----
     case 2:
       display.setTextSize(1);
       display.setCursor(0, 11);
       display.println("PUMP STATUS");
-
       display.setTextSize(2);
       display.setCursor(0, 22);
       display.println(pumpRunning ? "RUNNING" : "IDLE   ");
-
       display.setTextSize(1);
       display.setCursor(0, 42);
       display.printf("Mode: %s", manualOverride ? "MANUAL" : "AUTO  ");
@@ -425,13 +406,10 @@ void updateOLED(SensorData data) {
       display.printf("Cycles today: %d", wateringCountToday);
       break;
 
-    // ---- PAGE 3: Signal & Time ----
     case 3:
       display.setTextSize(1);
       display.setCursor(0, 11);
       display.println("NETWORK & TIME");
-
-      // Big signal bars (decorative, larger)
       {
         int bx = 0, by = 22;
         int bW = 8, gap = 3;
@@ -446,7 +424,6 @@ void updateOLED(SensorData data) {
           else
             display.drawRect(px, py, bW, bh, SSD1306_WHITE);
         }
-        // dBm label
         display.setCursor(50, 30);
         display.setTextSize(1);
         if (signalBars == 0) display.print("No signal");
@@ -456,23 +433,18 @@ void updateOLED(SensorData data) {
           display.printf("%d/4 bars", signalBars);
         }
       }
-
       display.setCursor(0, 54);
       display.printf("SimHr:%02d  Day:%d Wk:%d", st.hour, st.day, st.week);
       break;
   }
 
-  // Write to display — if it fails (inrush current glitch), reinit
-  // Adafruit_SSD1306 doesn't return errors, so we detect by re-checking I2C
   display.display();
 
-  // Periodic OLED health check — reinit if it went blank due to voltage sag
   if (millis() - lastOledReinit > 5000) {
     lastOledReinit = millis();
     Wire.beginTransmission(OLED_ADDRESS);
     byte err = Wire.endTransmission();
     if (err != 0) {
-      // I2C device not responding — reinit
       oledFailCount++;
       Serial.printf("[OLED] I2C err %d, reinit attempt #%d\n", err, oledFailCount);
       displayAvailable = false;
@@ -485,25 +457,19 @@ void updateOLED(SensorData data) {
         Serial.println("[OLED] Reinit OK");
       }
     } else {
-      oledFailCount = 0; // I2C healthy
+      oledFailCount = 0;
     }
   }
 }
 
 // =====================
-//   SERIAL PORT OWNERSHIP
-// =====================
-String simBuffer = ""; // persistent RX buffer for handleIncomingCall
-bool   simBusy   = false; // true while sendATCommand owns serial
-
-// =====================
-//   SIM900A: Send AT Command (FIXED: Longer timeout)
+//   SIM900A: Send AT Command
 // =====================
 String sendATCommand(String cmd, int timeout) {
   simBusy   = true;
   simBuffer = "";
-  delay(50);                            // brief wait so any in-flight bytes arrive
-  while (sim900.available()) sim900.read(); // flush hardware buffer
+  delay(50);
+  while (sim900.available()) sim900.read();
   sim900.println(cmd);
 
   String response = "";
@@ -516,33 +482,27 @@ String sendATCommand(String cmd, int timeout) {
         response.indexOf("ERROR")   != -1 ||
         response.indexOf(">")       != -1 ||
         response.indexOf("CONNECT") != -1) break;
-    // NOTE: +CMGS removed from early-exit — it appears in AT+CMGS="..." echo
-    // and causes premature bailout before the > prompt arrives
     delay(5);
   }
   response.trim();
-  simBusy = false;                      // release serial port back to handleIncomingCall
+  simBusy = false;
   if (response.length() > 0)
     Serial.printf("[SIM] CMD:%s | RSP:%s\n", cmd.c_str(), response.c_str());
   return response;
 }
 
 // =====================
-//   SIM900A: Init (FIXED: Add SMSC setup)
+//   SIM900A: Init
 // =====================
 bool initSIM900() {
   Serial.println("[SIM] Initializing SIM900A...");
   for (int i = 0; i < 5; i++) {
     String rsp = sendATCommand("AT", 1000);
     if (rsp.indexOf("OK") != -1) {
-      sendATCommand("ATE0",             500);  // echo off
-      sendATCommand("AT+CMGF=1",        500);  // text mode
-      sendATCommand("AT+CNMI=2,2,0,0,0",500);  // SMS direct to serial
-      
-      // FIXED: Set SMSC for India carriers (Jio/Airtel)
-      // Change this number based on your carrier
+      sendATCommand("ATE0",              500);
+      sendATCommand("AT+CMGF=1",         500);
+      sendATCommand("AT+CNMI=2,2,0,0,0", 500);
       sendATCommand("AT+CSCA=\"+919999999999\"", 1000);
-      
       Serial.println("[SIM] SIM900A ready");
       return true;
     }
@@ -553,9 +513,8 @@ bool initSIM900() {
 }
 
 // =====================
-//   SIM900A: Send SMS (COMPLETELY FIXED)
+//   SIM900A: Send SMS (enqueue)
 // =====================
-// Enqueue an SMS — returns immediately, no blocking
 void sendSMS(String message, bool force) {
   if (!simAvailable) { logError("SMS", "SIM not available"); return; }
   if (!force && (millis() - lastSMSTime < SMS_THROTTLE_TIME)) {
@@ -574,20 +533,16 @@ void sendSMS(String message, bool force) {
 }
 
 // =====================
-//   NON-BLOCKING SMS STATE MACHINE — call every loop()
+//   NON-BLOCKING SMS STATE MACHINE
 // =====================
 void processSMS() {
   if (!simAvailable) return;
 
   unsigned long now = millis();
 
-  // Nothing to do
   if (smsState == SMS_IDLE && smsQueueCount == 0) return;
-
-  // Cooldown between sends — SIM900A needs recovery time
   if (smsState == SMS_IDLE && now < smsCooldownUntil) return;
 
-  // Start next queued message
   if (smsState == SMS_IDLE && smsQueueCount > 0) {
     if (signalBars < 1) return;
     smsPending   = smsQueue[smsQueueHead];
@@ -596,7 +551,7 @@ void processSMS() {
     smsState      = SMS_SET_MODE;
     smsStateStart = now;
     simBusy       = true;
-    while (sim900.available()) sim900.read(); // flush stale bytes
+    while (sim900.available()) sim900.read();
     sim900.println("AT+CMGF=1");
     Serial.println("[SMS] State: SET_MODE -> " + smsPending.substring(0, 30));
     return;
@@ -605,19 +560,17 @@ void processSMS() {
   switch (smsState) {
 
     case SMS_SET_MODE: {
-      // Drain all available bytes into a response string
       String r = "";
       while (sim900.available()) r += (char)sim900.read();
       if (r.indexOf("OK") != -1) {
         smsState      = SMS_SEND_CMD;
         smsStateStart = now;
-        sim900.println("AT+CMGS="" + String(PHONE_NUMBER) + """);
+        sim900.println("AT+CMGS=\"" + String(PHONE_NUMBER) + "\"");
         Serial.println("[SMS] State: SEND_CMD");
       } else if (r.indexOf("ERROR") != -1) {
         Serial.println("[SMS] SET_MODE ERROR — retrying in 3s");
         smsState = SMS_IDLE; simBusy = false;
         smsCooldownUntil = now + 3000;
-        // Put message back at front of queue
         smsQueueHead = (smsQueueHead - 1 + SMS_QUEUE_SIZE) % SMS_QUEUE_SIZE;
         smsQueue[smsQueueHead] = smsPending;
         smsQueueCount++;
@@ -640,7 +593,7 @@ void processSMS() {
         smsStateStart = now;
         sim900.print(smsPending);
         delay(100);
-        sim900.write(0x1A); // Ctrl+Z
+        sim900.write(0x1A);
         Serial.println("[SMS] State: WAIT_CONFIRM");
       } else if (r.indexOf("ERROR") != -1 || now - smsStateStart > 6000) {
         Serial.println("[SMS] SEND_CMD failed");
@@ -655,25 +608,24 @@ void processSMS() {
       String r = "";
       while (sim900.available()) r += (char)sim900.read();
       if (r.indexOf("+CMGS:") != -1 || r.indexOf("OK") != -1) {
-        Serial.println("[SMS] ✓ Sent: " + smsPending.substring(0, 40));
+        Serial.println("[SMS] Sent: " + smsPending.substring(0, 40));
         failedSMSCount   = 0;
         lastSMSTime      = now;
         smsState         = SMS_IDLE;
         simBusy          = false;
-        smsCooldownUntil = now + 4000; // 4s before next send
+        smsCooldownUntil = now + 4000;
       } else if (r.indexOf("ERROR") != -1) {
-        Serial.println("[SMS] ✗ Error on confirm");
+        Serial.println("[SMS] Error on confirm");
         failedSMSCount++;
         smsState = SMS_IDLE; simBusy = false;
         smsCooldownUntil = now + 3000;
       } else if (now - smsStateStart > 8000) {
-        // No echo — SIM900A quirk, treat as sent
-        Serial.println("[SMS] ✓ Assumed sent (no echo)");
+        Serial.println("[SMS] Assumed sent (no echo)");
         failedSMSCount   = 0;
         lastSMSTime      = now;
         smsState         = SMS_IDLE;
         simBusy          = false;
-        smsCooldownUntil = now + 5000; // longer cooldown after no-echo
+        smsCooldownUntil = now + 5000;
       }
       break;
     }
@@ -693,15 +645,12 @@ void processSMS() {
   }
 }
 
-
-
-
 // =====================
 //   SIM900A: Check Signal
 // =====================
 void checkSignal() {
   if (!simAvailable) return;
-  if (simBusy) return; // don't interrupt an ongoing SMS send
+  if (simBusy) return;
   String rsp = sendATCommand("AT+CSQ", 1000);
   int idx = rsp.indexOf("+CSQ:");
   if (idx != -1) {
@@ -720,69 +669,70 @@ void checkSignal() {
 }
 
 // =====================
-//   ON-DEMAND STATUS REPORT (FIXED: Rain data in one line)
+//   STATUS REPORT
 // =====================
 void sendStatusReport() {
   SimTime st = getSimTime();
-  
-  // FIXED: Make message shorter and put all rain data on one line
   String msg = "SOIL:" + String((int)lastKnownData.moisture) + "%";
-  if      (lastKnownData.moisture < MOISTURE_LOW)   msg += "(DRY-PUMP) ";  // 0-25%
-  else if (lastKnownData.moisture <= MOISTURE_HIGH) msg += "(SCHED) ";     // 25-50%
-  else                                              msg += "(WET-SKIP) ";  // >50%
+  if      (lastKnownData.moisture < MOISTURE_LOW)   msg += "(DRY) ";
+  else if (lastKnownData.moisture <= MOISTURE_HIGH) msg += "(SCHED) ";
+  else                                              msg += "(WET) ";
   msg += "RAIN:" + String(lastKnownData.isRaining ? "YES" : "NO") + " ";
   msg += "T:" + String((int)lastKnownData.temperature) + "C H:" + String((int)lastKnownData.humidity) + "% ";
   msg += "PUMP:" + String(pumpRunning ? "ON" : "OFF") + " ";
   msg += "MODE:" + String(manualOverride ? "MANUAL" : "AUTO") + " ";
   msg += "CYCLES:" + String(wateringCountToday) + " ";
   msg += "RAIN(D/W/M):" + String(rainDaily, 1) + "/" + String(rainWeekly, 1) + "/" + String(rainMonthly, 1) + "mm";
-  
-  // Ensure message doesn't exceed 160 chars
-  if (msg.length() > 160) {
-    msg = msg.substring(0, 160);
-  }
-  
+  if (msg.length() > 160) msg = msg.substring(0, 160);
   Serial.println("[SMS] Status report length: " + String(msg.length()) + " chars");
-  sendSMS(msg, true);  // force: report sent to both numbers
+  sendSMS(msg, true);
 }
 
 // =====================
-//   PARSE INCOMING SMS COMMAND
-//   REPORT   → full status
-//   PUMP ON  → manual pump on
-//   PUMP OFF → manual pump off
-//   AUTO     → restore auto mode
+//   PARSE INCOMING SMS
 // =====================
 void parseIncomingSMS(String text) {
   text.trim();
   text.toUpperCase();
   Serial.println("[SMS] Cmd: " + text);
 
-  if      (text.indexOf("REPORT")   != -1) { sendStatusReport(); }
-  else if (text.indexOf("PUMP ON")  != -1) { manualOverride = true;  setPump(true);  sendSMS("OK: Pump ON. Manual mode active.", true); }
-  else if (text.indexOf("PUMP OFF") != -1) { manualOverride = true;  setPump(false); sendSMS("OK: Pump OFF. Manual mode active.", true); }
-  else if (text.indexOf("AUTO")     != -1) { manualOverride = false; setPump(false); sendSMS("OK: Auto mode restored. Pump OFF.", true); }
-  else                                     { sendSMS("Cmds: REPORT / PUMP ON / PUMP OFF / AUTO", true); }
+  if (text.indexOf("RELAY ON") != -1) {
+    manualOverride = true;
+    setPump(true);
+    sendSMS("OK: Pump ON (Manual mode)", true);
+  }
+  else if (text.indexOf("RELAY OFF") != -1) {
+    manualOverride = true;
+    setPump(false);
+    sendSMS("OK: Pump OFF (Manual mode)", true);
+  }
+  else if (text.indexOf("AUTO") != -1) {
+    manualOverride = false;
+    setPump(false);
+    sendSMS("OK: AUTO mode. Pump follows soil moisture.", true);
+  }
+  else if (text.indexOf("REPORT") != -1) {
+    sendStatusReport();
+  }
+  else {
+    sendSMS("RELAY ON / RELAY OFF / AUTO / REPORT", true);
+  }
 }
 
 // =====================
-//   PERSISTENT SERIAL BUFFER
-//   Accumulates SIM900A output across loop() calls
-//   Processes only when a full line (\n) arrives
+//   PROCESS SIM LINE
 // =====================
-
 void processSimLine(String line) {
   line.trim();
   if (line.length() == 0) return;
 
   Serial.println("[SIM RX] " + line);
 
-  // --- Incoming CALL ---
   if (line.indexOf("RING") != -1) {
     unsigned long now = millis();
     if (now - lastRingTime > 3000) {
       lastRingTime = now;
-      Serial.println("[CALL] Ring detected → ATH + report");
+      Serial.println("[CALL] Ring detected -> ATH + report");
       delay(600);
       sendATCommand("ATH", 1000);
       delay(500);
@@ -791,9 +741,6 @@ void processSimLine(String line) {
     return;
   }
 
-  // --- Incoming SMS header: +CMT: "+91...","","date" ---
-  // Next line in buffer will be the message body
-  // We flag it and read the NEXT line as the SMS text
   static bool nextLineIsSMS = false;
   if (line.indexOf("+CMT:") != -1) {
     nextLineIsSMS = true;
@@ -806,15 +753,16 @@ void processSimLine(String line) {
   }
 }
 
+// =====================
+//   HANDLE INCOMING CALL/SMS
+// =====================
 void handleIncomingCall() {
-  if (simBusy) return;                  // AT command in progress — don't steal bytes
-  // Drain all available bytes into persistent buffer
+  if (simBusy) return;
   while (sim900.available()) {
     char c = (char)sim900.read();
     simBuffer += c;
   }
 
-  // Process every complete line in the buffer
   int nlIdx;
   while ((nlIdx = simBuffer.indexOf('\n')) != -1) {
     String line = simBuffer.substring(0, nlIdx);
@@ -822,7 +770,6 @@ void handleIncomingCall() {
     processSimLine(line);
   }
 
-  // Safety: discard if buffer grows too large (garbage data)
   if (simBuffer.length() > 512) {
     Serial.println("[SIM] Buffer overflow — clearing");
     simBuffer = "";
@@ -848,134 +795,66 @@ void updateRainStats(SensorData data) {
 
 // =====================
 //   WATERING CYCLE LOGIC
-//
-//   Moisture Tiers (AUTO mode only):
-//   0–25%   → CRITICAL DRY: Pump ON immediately, no schedule needed
-//   25–50%  → MODERATE: Water only at 6-hour scheduled intervals (0,6,12,18)
-//   >50%    → WET: No watering for the day
 // =====================
 void handleWateringCycle(SensorData data) {
+  Serial.printf("[WATER] moisture=%.1f manualOverride=%d pumpRunning=%d\n",
+    data.moisture, manualOverride, pumpRunning);
+
+  // Manual mode — do nothing, wait for AUTO command via SMS
   if (manualOverride) return;
 
   SimTime st = getSimTime();
 
-  // Reset daily counters on new sim day
+  // Reset daily watering count on new sim day
   if (st.day != lastWateringSimDay) {
-    wateringCountToday = 0;
     lastWateringSimDay = st.day;
-    rainedToday        = false; // new day — rain flag clears
+    wateringCountToday = 0;
   }
 
-  // Auto-stop pump after duration
-  if (pumpRunning && (millis() - pumpOnTime >= PUMP_ON_DURATION)) {
-    setPump(false);
-    wateringCycleActive = false;
-    Serial.println("[PUMP] Auto-stop after duration");
-  }
-
-  // Rain check — if raining NOW, set flag and block for rest of sim day
+  // Rain handling — turn pump off when raining, wait 25s after rain stops
   if (data.isRaining) {
-    if (!rainedToday) {
-      rainedToday = true;
-      if (pumpRunning) { setPump(false); }
-      Serial.println("[PUMP] Rain detected — watering blocked for rest of day");
-      sendSMS("Rain detected. No watering today.");
-    } else {
-      if (pumpRunning) { setPump(false); }
-    }
-    return;
-  }
-  // Even if not raining now, if it rained earlier today — still block
-  if (rainedToday) {
-    if (pumpRunning) { setPump(false); }
-    Serial.println("[PUMP] Blocked — rained earlier today");
-    return;
-  }
-
-  // Cooldown guard — don't restart pump too soon after it last turned off
-  bool inCooldown = (millis() - pumpLastOffTime < PUMP_COOLDOWN);
-  if (inCooldown && !pumpRunning) {
-    Serial.printf("[PUMP] Cooldown active (%.0fs left)\n",
-                  (PUMP_COOLDOWN - (millis() - pumpLastOffTime)) / 1000.0);
-    return;
-  }
-
-  // ---- TIER 1: CRITICAL DRY (0 to MOISTURE_LOW - HYSTERESIS) ----
-  // Use hysteresis: turn ON below LOW, don't turn OFF until above LOW+HYSTERESIS
-  // This prevents chatter when moisture bounces near the 25% boundary
-  float dryThresholdOn  = MOISTURE_LOW;                      // turn ON  below 25%
-  float dryThresholdOff = MOISTURE_LOW + MOISTURE_HYSTERESIS; // turn OFF above 30%
-
-  if (pumpRunning && wateringCycleActive) {
-    // Pump is already running in tier-1 mode — only stop it via duration timer (handled above)
-    // or if soil has recovered past the hysteresis OFF threshold
-    if (data.moisture >= dryThresholdOff) {
-      setPump(false);
-      wateringCycleActive = false;
-      Serial.printf("[PUMP] DRY tier: soil recovered to %.1f%% (>%d%%) — stopping\n",
-                    data.moisture, (int)dryThresholdOff);
-    }
-    return;
-  }
-
-  if (data.moisture < dryThresholdOn) {
-    if (!pumpRunning) {
-      setPump(true);
-      wateringCycleActive = true;
-      wateringCountToday++;
-      lastSimHour = st.hour;
-      Serial.printf("[PUMP] CRITICAL DRY: Immediate ON (moist=%.1f%%) cycle#%d\n",
-                    data.moisture, wateringCountToday);
-      sendSMS("ALERT: Soil critically dry (" + String((int)data.moisture) + "%). Pump ON now.");
-    }
-    return;
-  }
-
-  // ---- TIER 2: MODERATE (MOISTURE_LOW to MOISTURE_HIGH) ----
-  // Hysteresis: schedule fires between LOW+HYSTERESIS and HIGH-HYSTERESIS
-  // so a reading of 25.1% doesn't trigger a scheduled run then immediately bail
-  float schedLow  = MOISTURE_LOW  + MOISTURE_HYSTERESIS; // 30%
-  float schedHigh = MOISTURE_HIGH - MOISTURE_HYSTERESIS; // 45%
-
-  if (data.moisture >= schedLow && data.moisture <= schedHigh) {
-    bool inSchedule = false;
-    for (int i = 0; i < 4; i++) {
-      if (st.hour == wateringHours[i] && lastSimHour != st.hour) {
-        inSchedule = true; break;
-      }
-    }
-    if (inSchedule && !pumpRunning) {
-      setPump(true);
-      wateringCycleActive = true;
-      wateringCountToday++;
-      lastSimHour = st.hour;
-      Serial.printf("[PUMP] SCHEDULED (moist=%.1f%%) cycle#%d at hour %d\n",
-                    data.moisture, wateringCountToday, st.hour);
-    } else if (inSchedule) {
-      lastSimHour = st.hour; // consume hour even if pump already running
-    }
-    return;
-  }
-
-  // ---- TIER 3: WET (above MOISTURE_HIGH - HYSTERESIS) ----
-  if (data.moisture > (MOISTURE_HIGH - MOISTURE_HYSTERESIS)) {
+    rainActive = true;
+    rainStopTime = millis(); // keep resetting while still raining
     if (pumpRunning) {
       setPump(false);
-      wateringCycleActive = false;
-      Serial.printf("[PUMP] WET SOIL: Pump OFF — moisture %.1f%%\n", data.moisture);
-    } else {
-      bool inSchedule = false;
-      for (int i = 0; i < 4; i++) {
-        if (st.hour == wateringHours[i] && lastSimHour != st.hour) {
-          inSchedule = true; break;
-        }
-      }
-      if (inSchedule) {
-        lastSimHour = st.hour;
-        Serial.printf("[PUMP] WET SOIL: Skipping schedule (moist=%.1f%%)\n", data.moisture);
-      }
+      Serial.println("[PUMP] Rain detected — pump OFF");
+      sendSMS("RAIN: Pump OFF. Resumes 25s after rain stops.", false);
     }
     return;
+  } else if (rainActive) {
+    // Rain just stopped — start 25s countdown
+    if (millis() - rainStopTime < RAIN_RESUME_DELAY) {
+      Serial.printf("[RAIN] Waiting %lus before resuming...\n", (RAIN_RESUME_DELAY - (millis() - rainStopTime)) / 1000);
+      return;
+    } else {
+      rainActive = false;
+      Serial.println("[RAIN] Resume delay done — auto watering restored");
+      sendSMS("RAIN stopped. Auto watering resumed.", false);
+    }
+  }
+
+  // Turn ON only below 25% (dry) — 3 consecutive dry reads to prevent flicker
+  if (data.moisture < MOISTURE_LOW && !pumpRunning) {
+    dryReadCount++;
+    if (dryReadCount >= 3) {
+      setPump(true);
+      wateringCountToday++;
+      dryReadCount = 0;
+      Serial.printf("[AUTO] Soil dry (%.1f%%) -> PUMP ON\n", data.moisture);
+      sendSMS("AUTO: Soil dry (" + String((int)data.moisture) + "%). Pump ON.", false);
+    } else {
+      Serial.printf("[AUTO] Dry read %d/3 — waiting\n", dryReadCount);
+    }
+  }
+  // Turn OFF only above 55% (50% + 5% hysteresis)
+  else if (data.moisture > (MOISTURE_HIGH + MOISTURE_HYSTERESIS) && pumpRunning) {
+    dryReadCount = 0;
+    setPump(false);
+    Serial.printf("[AUTO] Soil wet (%.1f%%) -> PUMP OFF\n", data.moisture);
+    sendSMS("AUTO: Soil wet (" + String((int)data.moisture) + "%). Pump OFF.", false);
+  }
+  else {
+    dryReadCount = 0;
   }
 }
 
@@ -987,6 +866,7 @@ void setup() {
   Serial.println("\n[BOOT] Starting Smart Irrigation...");
 
   pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); // force relay OFF immediately at boot
   pinMode(RAIN_PIN, INPUT_PULLUP);
   setPump(false);
 
@@ -1001,7 +881,6 @@ void setup() {
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(20, 10); display.println("Smart Irrigation");
     display.setCursor(35, 28); display.println("Booting...");
-    // Draw empty signal bars placeholder
     drawSignalBars(112, 0, 0);
     display.display();
     Serial.println("[BOOT] OLED OK");
@@ -1036,8 +915,9 @@ void setup() {
   lastSignalCheck = millis();
   lastSensorRead  = millis();
 
-  // Seed lastKnownData so report is never blank
   lastKnownData = readSensors();
+  pumpLastOffTime = millis() - PUMP_COOLDOWN - 1; // allow immediate start after boot
+  pumpOnTime = millis(); // prevent false safety cutoff on first loop
 
   Serial.println("[BOOT] Done. Running.");
 }
@@ -1048,7 +928,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // ---- Sensor Read ----
+  // Sensor Read
   if (now - lastSensorRead >= SENSOR_READ_DELAY) {
     lastSensorRead = now;
     SensorData data = readSensors();
@@ -1064,24 +944,24 @@ void loop() {
       pumpRunning    ? "ON"  : "OFF");
   }
 
-  // ---- Signal Check ----
+  // Signal Check
   if (now - lastSignalCheck >= SIGNAL_CHECK_INTERVAL) {
     lastSignalCheck = now;
     checkSignal();
   }
 
-  // ---- Non-blocking SMS state machine ----
+  // Non-blocking SMS state machine
   processSMS();
 
-  // ---- Incoming Call / SMS Commands ----
+  // Incoming Call / SMS
   handleIncomingCall();
 
-  // ---- Safety: 60s hard pump cutoff ----
-  if (pumpRunning && !manualOverride && (now - pumpOnTime > 60000)) {
-    setPump(false);
-    logError("PUMP", "Safety cutoff >60s");
-    sendSMS("WARNING: Pump safety cutoff! >60s limit hit.", true);
-  }
+  // Safety: 60s hard pump cutoff — DISABLED FOR TESTING
+  // if (pumpRunning && !manualOverride && (now - pumpOnTime > 60000)) {
+  //   setPump(false);
+  //   logError("PUMP", "Safety cutoff >60s");
+  //   sendSMS("WARNING: Pump safety cutoff! >60s limit hit.", true);
+  // }
 
-  delay(20); // Short delay — keeps serial buffer responsive
+  delay(20);
 }
